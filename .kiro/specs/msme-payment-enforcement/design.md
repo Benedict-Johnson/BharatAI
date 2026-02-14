@@ -843,3 +843,494 @@ After analyzing all acceptance criteria, I identified several areas where proper
 *For any* previously synced invoice, the system should display cached invoice information when operating offline.
 **Validates: Requirements 15.3**
 
+
+## Error Handling
+
+### Error Categories and Strategies
+
+**1. External Service Failures**
+
+- **Amazon Textract Failures**: Retry up to 3 times with exponential backoff (1s, 2s, 4s). If all retries fail, flag document for manual review and notify retailer.
+- **Amazon Bedrock Throttling**: Implement exponential backoff with jitter. Queue requests if sustained throttling occurs.
+- **WhatsApp API Failures**: Retry up to 3 times, then fall back to email-only delivery. Log failure for retailer notification.
+- **Email (SES) Failures**: Retry up to 3 times. If permanent failure (invalid email), notify retailer to update buyer contact information.
+- **MSME Samadhaan Portal Errors**: Present error message to retailer with option to retry. Store draft submission for later retry.
+- **Udyam Portal API Failures**: Retry validation up to 3 times. If validation service is down, allow manual Udyam number entry with warning.
+
+**2. Data Validation Errors**
+
+- **Invalid GSTIN Format**: Reject immediately with clear error message explaining correct format (15 characters, specific pattern).
+- **Invalid Udyam Number Format**: Reject with error message and link to Udyam registration portal.
+- **Invalid Date Formats**: Attempt to parse multiple common formats. If parsing fails, prompt retailer to manually enter date.
+- **Invalid Amount**: Reject non-numeric or negative amounts with clear error message.
+- **Missing Mandatory Fields**: Prevent submission and highlight missing fields in UI.
+
+**3. Business Logic Errors**
+
+- **Duplicate Invoice Upload**: Check for existing invoice with same invoice number and buyer GSTIN. Prompt retailer to confirm if intentional.
+- **Payment Marked Before Invoice Date**: Reject with error message indicating payment date cannot precede invoice date.
+- **Invalid Payment Amount**: Warn if payment amount doesn't match principal + penalty, but allow retailer to proceed.
+
+**4. Authentication and Authorization Errors**
+
+- **Failed OTP Verification**: Allow up to 3 attempts, then lock account for 15 minutes. Provide option to resend OTP.
+- **Expired Session**: Redirect to login with message explaining session timeout.
+- **Unauthorized Access**: Return 403 error and log security event for monitoring.
+
+**5. Resource Limits**
+
+- **File Too Large**: Reject immediately with error message indicating 10MB limit.
+- **Rate Limiting**: Implement per-retailer rate limits (100 requests/minute). Return 429 status with retry-after header.
+- **Storage Quota**: Monitor S3 usage per retailer. Warn at 80% of quota, prevent new uploads at 100%.
+
+**6. Network and Connectivity Errors**
+
+- **Offline Mode**: Queue operations locally and sync when connectivity restored. Display clear offline indicator in UI.
+- **Timeout Errors**: Set reasonable timeouts (30s for Textract, 10s for Bedrock, 5s for API calls). Retry with backoff on timeout.
+- **Partial Upload Failures**: Implement resumable uploads for large files using S3 multipart upload.
+
+### Error Response Format
+
+All API errors follow a consistent JSON structure:
+
+```typescript
+interface ErrorResponse {
+  error: {
+    code: string; // Machine-readable error code
+    message: string; // Human-readable message in retailer's language
+    details?: Record<string, any>; // Additional context
+    retryable: boolean; // Whether client should retry
+    retryAfter?: number; // Seconds to wait before retry
+  };
+  requestId: string; // For support and debugging
+  timestamp: string; // ISO 8601
+}
+```
+
+### Logging and Monitoring
+
+- **CloudWatch Logs**: All Lambda functions log to CloudWatch with structured JSON logging
+- **Error Metrics**: Track error rates by type, component, and severity in CloudWatch Metrics
+- **Alarms**: Set up alarms for:
+  - Error rate > 5% for any Lambda function
+  - Textract failures > 10% of requests
+  - Bedrock throttling events
+  - Failed communications > 20% of attempts
+- **Distributed Tracing**: Use AWS X-Ray to trace requests across Lambda functions and external services
+
+## Testing Strategy
+
+### Dual Testing Approach
+
+The system requires both unit testing and property-based testing for comprehensive coverage:
+
+- **Unit tests**: Verify specific examples, edge cases, and error conditions
+- **Property tests**: Verify universal properties across all inputs using randomized test data
+
+Both testing approaches are complementary and necessary. Unit tests catch concrete bugs in specific scenarios, while property tests verify general correctness across a wide range of inputs.
+
+### Property-Based Testing Configuration
+
+**Framework Selection**:
+- **TypeScript/JavaScript**: Use `fast-check` library for property-based testing
+- **Python** (if used for data processing): Use `hypothesis` library
+
+**Test Configuration**:
+- Minimum 100 iterations per property test (due to randomization)
+- Each property test must reference its design document property
+- Tag format: `Feature: msme-payment-enforcement, Property {number}: {property_text}`
+
+**Example Property Test Structure**:
+
+```typescript
+import fc from 'fast-check';
+
+describe('Feature: msme-payment-enforcement, Property 7: Due Date Calculation', () => {
+  it('should calculate due date as exactly 45 days after invoice date', () => {
+    fc.assert(
+      fc.property(
+        fc.date(), // Generate random invoice dates
+        (invoiceDate) => {
+          const dueDate = calculateDueDate(invoiceDate);
+          const daysDiff = Math.floor(
+            (dueDate.getTime() - invoiceDate.getTime()) / (1000 * 60 * 60 * 24)
+          );
+          return daysDiff === 45;
+        }
+      ),
+      { numRuns: 100 }
+    );
+  });
+});
+```
+
+### Unit Testing Strategy
+
+**Focus Areas for Unit Tests**:
+1. **Specific Examples**: Test known invoice formats, specific GSTIN patterns, common date formats
+2. **Edge Cases**: Empty files, corrupted PDFs, boundary dates (leap years, month-end), zero amounts
+3. **Error Conditions**: Invalid formats, missing fields, network failures, authentication failures
+4. **Integration Points**: API contracts with external services (mocked), database operations, S3 operations
+
+**Avoid Over-Testing**:
+- Don't write exhaustive unit tests for scenarios covered by property tests
+- Focus unit tests on concrete examples that demonstrate correct behavior
+- Use unit tests for integration testing between components
+
+### Test Coverage by Component
+
+**Invoice Processor Lambda**:
+- Unit tests: Specific invoice formats (GST invoice, retail invoice), corrupted files, missing fields
+- Property tests: Properties 1-6 (file validation, processing time, multi-page consolidation, extraction completeness)
+
+**Payment Monitor Lambda**:
+- Unit tests: Specific date scenarios (month boundaries, leap years), edge case amounts
+- Property tests: Properties 7-9, 18-20 (date calculations, monitoring lifecycle, penalty calculations)
+
+**Communication Agent Lambda**:
+- Unit tests: Specific message templates, retry scenarios, delivery failures
+- Property tests: Properties 10-13 (reminder scheduling, language consistency, required fields, retry logic)
+
+**Legal Document Generator Lambda**:
+- Unit tests: Specific legal notice formats, edge case penalties
+- Property tests: Properties 14-17 (mandatory elements, penalty inclusion, approval workflow, delivery)
+
+**Risk Analyzer Lambda**:
+- Unit tests: Specific buyer scenarios (new buyer, excellent history, poor history)
+- Property tests: Properties 26-29 (score retrieval, metric sensitivity, range validation, category assignment)
+
+**Samadhaan Integrator Lambda**:
+- Unit tests: Specific Udyam validation scenarios, API failures
+- Property tests: Properties 21-25 (validation, form pre-filling, attachments, approval workflow, submission)
+
+**Voice Interface Handler Lambda**:
+- Unit tests: Specific voice commands, noise scenarios, unclear speech
+- Property tests: Properties 30-33 (language support, transcription performance, intent recognition, command coverage)
+
+**Multi-Language Support**:
+- Unit tests: Specific translations for key phrases
+- Property tests: Properties 11, 34-35 (language consistency, UI updates, currency formatting)
+
+**Payment Lifecycle**:
+- Unit tests: Specific payment scenarios (on-time, late, partial)
+- Property tests: Properties 36-39 (payment marking, duration calculation, history updates, penalty recording)
+
+**Notification System**:
+- Unit tests: Specific notification scenarios
+- Property tests: Properties 40-45 (various notification triggers)
+
+**Security and Privacy**:
+- Unit tests: Specific encryption scenarios, authentication flows
+- Property tests: Properties 46-51 (encryption, anonymization, authentication, TLS)
+
+**Audit Trail**:
+- Unit tests: Specific audit scenarios
+- Property tests: Properties 52-56 (logging completeness, timestamping, trail generation)
+
+**Offline Capability**:
+- Unit tests: Specific offline scenarios (capture, sync, conflicts)
+- Property tests: Properties 57-59 (offline capture, sync, data access)
+
+### Integration Testing
+
+**End-to-End Flows**:
+1. Complete invoice lifecycle: Upload → Extract → Monitor → Remind → Notice → Payment
+2. Dispute filing flow: Upload → Overdue → Notice → File Dispute → Confirmation
+3. Buyer scoring flow: Multiple invoices → Payment patterns → Score calculation → Risk assessment
+
+**External Service Integration**:
+- Mock external APIs (Textract, Bedrock, WhatsApp, Samadhaan, Udyam) for integration tests
+- Use AWS SAM Local or LocalStack for local Lambda testing
+- Implement contract tests to verify API expectations
+
+### Performance Testing
+
+**Load Testing**:
+- Simulate 1000 concurrent retailers uploading invoices
+- Test Payment Monitor with 10,000 active invoices
+- Verify auto-scaling behavior of Lambda functions
+
+**Latency Testing**:
+- Measure end-to-end latency for invoice processing (target: < 30s)
+- Measure API response times (target: < 500ms for queries, < 3s for voice transcription)
+- Test under various network conditions (3G, 4G, WiFi)
+
+### Security Testing
+
+**Penetration Testing**:
+- Test authentication bypass attempts
+- Test SQL injection and NoSQL injection
+- Test unauthorized access to other retailers' data
+- Test encryption at rest and in transit
+
+**Compliance Testing**:
+- Verify GDPR-like data privacy compliance
+- Verify Indian data localization requirements
+- Verify audit trail completeness for legal requirements
+
+### Continuous Integration
+
+**CI/CD Pipeline**:
+1. Run unit tests on every commit
+2. Run property tests (with reduced iterations: 20) on every commit
+3. Run full property tests (100 iterations) on pull requests
+4. Run integration tests on staging deployment
+5. Run security scans (SAST, dependency scanning) on every build
+
+**Test Reporting**:
+- Generate coverage reports (target: > 80% line coverage)
+- Track property test failure rates
+- Monitor test execution time trends
+
+## Deployment Architecture
+
+### AWS Infrastructure
+
+**Compute**:
+- AWS Lambda functions (Node.js 20.x runtime for TypeScript)
+- Memory allocation: 512MB-2GB depending on function (Textract processing needs more)
+- Timeout: 30s for most functions, 60s for invoice processing
+- Concurrency limits: Reserved concurrency for critical functions (Payment Monitor, Communication Agent)
+
+**API Layer**:
+- Amazon API Gateway (REST API)
+- WebSocket API for real-time notifications
+- API Gateway request validation for input sanitization
+- Usage plans and API keys for rate limiting
+
+**Authentication**:
+- Amazon Cognito User Pools for retailer authentication
+- MFA enabled (SMS OTP or TOTP)
+- Custom authentication flow for biometric verification
+
+**Event Orchestration**:
+- Amazon EventBridge for event-driven architecture
+- Scheduled rules for Payment Monitor (every 6 hours)
+- Event patterns for invoice lifecycle events
+
+**Data Storage**:
+- Amazon Aurora PostgreSQL (Serverless v2) for transactional data
+- Multi-AZ deployment for high availability
+- Automated backups with 7-year retention
+- Encryption at rest using AWS KMS
+
+**Object Storage**:
+- Amazon S3 for documents and voice recordings
+- S3 Intelligent-Tiering for cost optimization
+- Lifecycle policies: Glacier after 1 year, retain for 7 years
+- Versioning enabled for legal documents
+
+**AI Services**:
+- Amazon Bedrock (Claude 3.5 Sonnet) for text generation and analysis
+- Amazon Textract for document OCR
+- Amazon Transcribe for speech-to-text (Tamil, Hindi, English)
+- Amazon Polly for text-to-speech (Tamil, Hindi, English)
+
+**Messaging**:
+- Amazon SES for email delivery
+- WhatsApp Business API (third-party integration)
+- Amazon SNS for push notifications to mobile app
+
+**Monitoring and Logging**:
+- Amazon CloudWatch Logs for centralized logging
+- Amazon CloudWatch Metrics for performance monitoring
+- AWS X-Ray for distributed tracing
+- CloudWatch Alarms for alerting
+
+**Security**:
+- AWS WAF for API Gateway protection
+- AWS Secrets Manager for API keys and credentials
+- AWS KMS for encryption key management
+- VPC for Aurora database isolation
+
+### Infrastructure as Code
+
+Use AWS CDK (TypeScript) for infrastructure provisioning:
+
+```typescript
+// Example CDK stack structure
+class MsmePaymentEnforcementStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
+    super(scope, id, props);
+
+    // Aurora Serverless v2 cluster
+    const database = new rds.DatabaseCluster(this, 'Database', {
+      engine: rds.DatabaseClusterEngine.auroraPostgres({
+        version: rds.AuroraPostgresEngineVersion.VER_15_3,
+      }),
+      serverlessV2MinCapacity: 0.5,
+      serverlessV2MaxCapacity: 2,
+      defaultDatabaseName: 'msme_enforcement',
+      enableDataApi: true,
+    });
+
+    // S3 bucket for documents
+    const documentBucket = new s3.Bucket(this, 'DocumentBucket', {
+      encryption: s3.BucketEncryption.KMS,
+      versioned: true,
+      lifecycleRules: [
+        {
+          transitions: [
+            {
+              storageClass: s3.StorageClass.GLACIER,
+              transitionAfter: Duration.days(365),
+            },
+          ],
+          expiration: Duration.days(2555), // 7 years
+        },
+      ],
+    });
+
+    // Lambda functions
+    const invoiceProcessor = new lambda.Function(this, 'InvoiceProcessor', {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('dist/invoice-processor'),
+      timeout: Duration.seconds(60),
+      memorySize: 2048,
+      environment: {
+        DATABASE_SECRET_ARN: database.secret!.secretArn,
+        DOCUMENT_BUCKET: documentBucket.bucketName,
+      },
+    });
+
+    // EventBridge rules
+    const paymentMonitorRule = new events.Rule(this, 'PaymentMonitorRule', {
+      schedule: events.Schedule.rate(Duration.hours(6)),
+    });
+    paymentMonitorRule.addTarget(new targets.LambdaFunction(paymentMonitor));
+
+    // API Gateway
+    const api = new apigateway.RestApi(this, 'Api', {
+      restApiName: 'MSME Payment Enforcement API',
+      deployOptions: {
+        tracingEnabled: true,
+        loggingLevel: apigateway.MethodLoggingLevel.INFO,
+      },
+    });
+  }
+}
+```
+
+### Deployment Strategy
+
+**Environments**:
+1. **Development**: Single-region, minimal resources, no data retention
+2. **Staging**: Production-like, synthetic test data, full monitoring
+3. **Production**: Multi-AZ, full redundancy, 7-year data retention
+
+**Deployment Process**:
+1. Build and test in CI/CD pipeline
+2. Deploy to staging environment
+3. Run smoke tests and integration tests
+4. Manual approval gate
+5. Blue-green deployment to production
+6. Monitor error rates and rollback if needed
+
+**Rollback Strategy**:
+- Lambda function versions and aliases for instant rollback
+- Database migrations use forward-compatible changes only
+- Feature flags for gradual rollout of new features
+
+### Cost Optimization
+
+**Estimated Monthly Costs** (for 10,000 active retailers, 50,000 invoices/month):
+
+- Lambda: $200-300 (pay per invocation)
+- Aurora Serverless v2: $150-250 (scales with load)
+- S3: $50-100 (with Intelligent-Tiering)
+- Textract: $500-800 (based on page count)
+- Bedrock: $300-500 (based on token usage)
+- API Gateway: $50-100
+- Other services: $100-200
+
+**Total**: ~$1,350-2,250/month
+
+**Cost Optimization Strategies**:
+- Use Lambda reserved concurrency only where needed
+- Implement caching for buyer reliability scores (24-hour TTL)
+- Batch Textract requests where possible
+- Use S3 Intelligent-Tiering for automatic cost optimization
+- Monitor and optimize Bedrock token usage
+
+## Security and Compliance
+
+### Data Privacy
+
+**Indian Data Localization**:
+- All data stored in AWS Asia Pacific (Mumbai) region
+- No cross-border data transfer without explicit consent
+- Compliance with proposed Indian data protection laws
+
+**PII Protection**:
+- Encrypt all PII at rest (AES-256)
+- Encrypt all PII in transit (TLS 1.3)
+- Anonymize data for analytics and buyer scoring
+- Implement data retention policies (7 years for financial records)
+
+**Access Control**:
+- Principle of least privilege for all IAM roles
+- Multi-factor authentication for all admin access
+- Audit logging for all data access
+
+### Compliance Requirements
+
+**MSMED Act Compliance**:
+- Accurate calculation of 45-day payment window
+- Correct compound interest penalty calculation (3x bank rate)
+- Proper legal notice format and content
+- Audit trail for all enforcement actions
+
+**Indian Tax Law Compliance**:
+- 7-year data retention for financial records
+- Proper GSTIN validation and storage
+- Audit trail for all transactions
+
+**WhatsApp Business Policy Compliance**:
+- Opt-in required for WhatsApp communications
+- 24-hour messaging window for non-template messages
+- Approved message templates for reminders and notices
+
+### Security Best Practices
+
+**Application Security**:
+- Input validation on all API endpoints
+- SQL injection prevention (parameterized queries)
+- XSS prevention (output encoding)
+- CSRF protection (API Gateway request validation)
+
+**Infrastructure Security**:
+- VPC isolation for database
+- Security groups with minimal required access
+- AWS WAF rules for common attack patterns
+- Regular security patching of Lambda runtimes
+
+**Monitoring and Incident Response**:
+- Real-time alerting for security events
+- Automated response to common threats (rate limiting, IP blocking)
+- Incident response playbook for data breaches
+- Regular security audits and penetration testing
+
+## Future Enhancements
+
+**Phase 2 Features**:
+1. **Predictive Analytics**: ML model to predict payment likelihood based on buyer behavior
+2. **Bulk Invoice Upload**: Process multiple invoices in a single upload
+3. **Payment Gateway Integration**: Allow buyers to pay directly through the platform
+4. **Retailer Community**: Forum for retailers to share experiences with buyers
+5. **Advanced Reporting**: Analytics dashboard for payment trends and buyer behavior
+
+**Phase 3 Features**:
+1. **Multi-Currency Support**: Support for international transactions
+2. **Blockchain Integration**: Immutable audit trail using blockchain
+3. **AI-Powered Negotiation**: Chatbot to negotiate payment terms with buyers
+4. **Credit Line Integration**: Connect retailers with lenders based on receivables
+5. **Mobile App Enhancements**: Offline-first architecture, biometric authentication
+
+**Scalability Considerations**:
+- Current architecture supports up to 100,000 retailers and 1M invoices/month
+- For larger scale, consider:
+  - DynamoDB for invoice metadata (better horizontal scaling)
+  - Amazon SQS for asynchronous processing
+  - ElastiCache for caching buyer scores and invoice data
+  - Multi-region deployment for global expansion
